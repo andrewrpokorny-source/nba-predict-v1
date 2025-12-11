@@ -2,13 +2,16 @@ import streamlit as st
 import pandas as pd
 import joblib
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime
 from nba_api.stats.endpoints import scoreboardv2
 from nba_locations import TEAM_COORDINATES
+import warnings
 
-# -------------------------------------------------------------------
-# 1. SETUP & HELPER FUNCTIONS
-# -------------------------------------------------------------------
+# Silence warnings in the dashboard
+warnings.filterwarnings("ignore")
+
+# 1. MATH & CONFIG
+st.set_page_config(page_title="NBA AI Oracle", page_icon="🏀", layout="wide")
 
 def haversine_distance(lat1, lon1, lat2, lon2):
     R = 3958.8
@@ -19,141 +22,131 @@ def haversine_distance(lat1, lon1, lat2, lon2):
     c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
     return R * c
 
-@st.cache_data # Caches data so it doesn't reload on every click
+@st.cache_data
 def load_data():
     try:
-        model = joblib.load('nba_model.pkl')
+        models = joblib.load('nba_model_v2.pkl')
         df = pd.read_csv('nba_games_processed.csv')
         df['GAME_DATE'] = pd.to_datetime(df['GAME_DATE'])
-        return model, df
+        return models, df
     except FileNotFoundError:
         return None, None
 
 def get_todays_games():
     today = datetime.now().strftime('%Y-%m-%d')
-    board = scoreboardv2.ScoreboardV2(game_date=today)
-    games = board.game_header.get_data_frame()
-    return games
+    try:
+        board = scoreboardv2.ScoreboardV2(game_date=today)
+        games = board.game_header.get_data_frame()
+        return games
+    except:
+        return pd.DataFrame()
 
 def get_team_stats(team_id, df):
-    # Get last game stats for a team
     team_games = df[df['TEAM_ID'] == team_id].sort_values('GAME_DATE')
     if team_games.empty: return None
-    
-    last_game = team_games.iloc[-1]
-    return {
-        'AVG_10_PTS': last_game['AVG_10_PTS'],
-        'AVG_10_FG_PCT': last_game['AVG_10_FG_PCT'],
-        'AVG_10_PLUS_MINUS': last_game['AVG_10_PLUS_MINUS'],
-        'AVG_10_AST': last_game['AVG_10_AST'],
-        'AVG_10_REB': last_game['AVG_10_REB'],
-        'LAST_GAME_DATE': last_game['GAME_DATE'],
-        'LAST_LAT': last_game['LAT'],
-        'LAST_LON': last_game['LON'],
-        'TEAM_NAME': last_game['TEAM_NAME']
-    }
+    return team_games.iloc[-1]
 
-# -------------------------------------------------------------------
-# 2. THE APP LAYOUT
-# -------------------------------------------------------------------
-
-st.set_page_config(page_title="NBA AI Oracle", page_icon="🏀")
-
+# 2. MAIN APP
 st.title("🏀 NBA AI Oracle")
-st.markdown("### Advanced Analytics & Prediction Engine")
+st.markdown("### Hybrid Linear/Tree Ensemble (MAE: 9.35)")
 
-# Load Resources
-model, df = load_data()
+models, df = load_data()
 
-if model is None:
-    st.error("❌ Model or Data not found. Please run the pipeline first!")
+if models is None:
+    st.error("❌ Models not found. Run train_model.py first.")
     st.stop()
 
-# Sidebar: Model Stats
-st.sidebar.header("🧠 Model Stats")
-st.sidebar.info(f"Training Data: {len(df)} games")
-st.sidebar.info("Model: Gradient Boosting (Scikit-Learn)")
+pace_model = models['pace']
+eff_model = models['eff']
 
-# TAB 1: TODAY'S PREDICTIONS
 games = get_todays_games()
 
 if games.empty:
-    st.warning("No games scheduled for today.")
+    st.info("No games scheduled for today.")
 else:
-    st.subheader(f"📅 Predictions for {datetime.now().strftime('%Y-%m-%d')}")
-    
+    # INPUT COLUMNS (Must match train_model.py EXACTLY)
+    feature_cols = [
+        'REST_DAYS', 'IS_HOME', 'ELO', 'ELO_OPP_LOOKUP',
+        'AVG_10_OFF_RTG', 'AVG_10_PACE', 'AVG_10_OFF_RTG_OPP_LOOKUP', 'AVG_10_PACE_OPP_LOOKUP',
+        'AVG_ALL_OFF_RTG', 'AVG_ALL_PACE', 'AVG_ALL_OFF_RTG_OPP_LOOKUP', 'AVG_ALL_PACE_OPP_LOOKUP',
+        'ELO_DIFF', 'OFF_RTG_DIFF', 'PACE_DIFF'
+    ]
+
     predictions = []
-    
-    today_date = pd.to_datetime(datetime.now().date())
-    
-    # Progress bar for calculation
-    progress_bar = st.progress(0)
-    
-    for i, game in games.iterrows():
-        home_id = game['HOME_TEAM_ID']
-        visitor_id = game['VISITOR_TEAM_ID']
+    today = pd.to_datetime(datetime.now().date())
+
+    for i, g in games.iterrows():
+        h_id, v_id = g['HOME_TEAM_ID'], g['VISITOR_TEAM_ID']
+        h_stats = get_team_stats(h_id, df)
+        v_stats = get_team_stats(v_id, df)
         
-        h_stats = get_team_stats(home_id, df)
-        v_stats = get_team_stats(visitor_id, df)
+        if h_stats is None or v_stats is None: continue
         
-        if not h_stats or not v_stats:
-            continue
-            
-        # Calculate Context (Rest/Travel)
-        h_rest = (today_date - h_stats['LAST_GAME_DATE']).days
-        v_rest = (today_date - v_stats['LAST_GAME_DATE']).days
-        
-        h_coords = TEAM_COORDINATES.get(home_id, {'lat':0, 'lon':0})
-        # Visitor travels TO home arena
-        h_travel = haversine_distance(h_stats['LAST_LAT'], h_stats['LAST_LON'], h_coords['lat'], h_coords['lon'])
-        v_travel = haversine_distance(v_stats['LAST_LAT'], v_stats['LAST_LON'], h_coords['lat'], h_coords['lon'])
-        
-        # Build Input (Must match training columns perfectly)
-        features = [
-            'REST_DAYS', 'IS_HOME', 'IS_B2B', 'TRAVEL_MILES',
-            'AVG_10_PTS', 'AVG_10_FG_PCT', 'AVG_10_PLUS_MINUS',
-            'AVG_10_AST', 'AVG_10_REB',
-            'AVG_10_PTS_OPP', 'AVG_10_PLUS_MINUS_OPP',
-            'IS_B2B_OPP', 'TRAVEL_MILES_OPP'
+        # Context
+        h_rest = (today - h_stats['GAME_DATE']).days
+        v_rest = (today - v_stats['GAME_DATE']).days
+        h_coords = TEAM_COORDINATES.get(h_id, {'lat':0,'lon':0})
+        h_trav = haversine_distance(h_stats['LAT'], h_stats['LON'], h_coords['lat'], h_coords['lon'])
+        v_trav = haversine_distance(v_stats['LAT'], v_stats['LON'], h_coords['lat'], h_coords['lon'])
+
+        # CALCULATE DIFFS
+        h_elo_diff = h_stats['ELO'] - v_stats['ELO']
+        h_off_diff = h_stats['AVG_10_OFF_RTG'] - v_stats['AVG_10_OFF_RTG']
+        h_pace_diff = h_stats['AVG_10_PACE'] - v_stats['AVG_10_PACE']
+
+        v_elo_diff = v_stats['ELO'] - h_stats['ELO']
+        v_off_diff = v_stats['AVG_10_OFF_RTG'] - h_stats['AVG_10_OFF_RTG']
+        v_pace_diff = v_stats['AVG_10_PACE'] - h_stats['AVG_10_PACE']
+
+        # BUILD ROWS
+        h_row = [
+            min(h_rest,7), 1, h_stats['ELO'], v_stats['ELO'],
+            h_stats['AVG_10_OFF_RTG'], h_stats['AVG_10_PACE'], v_stats['AVG_10_OFF_RTG'], v_stats['AVG_10_PACE'],
+            h_stats['AVG_ALL_OFF_RTG'], h_stats['AVG_ALL_PACE'], v_stats['AVG_ALL_OFF_RTG'], v_stats['AVG_ALL_PACE'],
+            h_elo_diff, h_off_diff, h_pace_diff
         ]
         
-        # Predict Home Score
-        h_input = [
-            min(h_rest, 7), 1, 1 if h_rest==1 else 0, h_travel,
-            h_stats['AVG_10_PTS'], h_stats['AVG_10_FG_PCT'], h_stats['AVG_10_PLUS_MINUS'], h_stats['AVG_10_AST'], h_stats['AVG_10_REB'],
-            v_stats['AVG_10_PTS'], v_stats['AVG_10_PLUS_MINUS'], 1 if v_rest==1 else 0, v_travel
+        v_row = [
+            min(v_rest,7), 0, v_stats['ELO'], h_stats['ELO'],
+            v_stats['AVG_10_OFF_RTG'], v_stats['AVG_10_PACE'], h_stats['AVG_10_OFF_RTG'], h_stats['AVG_10_PACE'],
+            v_stats['AVG_ALL_OFF_RTG'], v_stats['AVG_ALL_PACE'], h_stats['AVG_ALL_OFF_RTG'], h_stats['AVG_ALL_PACE'],
+            v_elo_diff, v_off_diff, v_pace_diff
         ]
+
+        # PREDICT
+        # Pace (Average of both perspectives)
+        p_pace = (pace_model.predict(pd.DataFrame([h_row], columns=feature_cols))[0] + 
+                  pace_model.predict(pd.DataFrame([v_row], columns=feature_cols))[0]) / 2
         
-        # Predict Visitor Score
-        v_input = [
-            min(v_rest, 7), 0, 1 if v_rest==1 else 0, v_travel,
-            v_stats['AVG_10_PTS'], v_stats['AVG_10_FG_PCT'], v_stats['AVG_10_PLUS_MINUS'], v_stats['AVG_10_AST'], v_stats['AVG_10_REB'],
-            h_stats['AVG_10_PTS'], h_stats['AVG_10_PLUS_MINUS'], 1 if h_rest==1 else 0, h_travel
-        ]
+        h_eff = eff_model.predict(pd.DataFrame([h_row], columns=feature_cols))[0]
+        v_eff = eff_model.predict(pd.DataFrame([v_row], columns=feature_cols))[0]
         
-        h_pred = model.predict([h_input])[0]
-        v_pred = model.predict([v_input])[0]
+        h_score = (p_pace / 100) * h_eff
+        v_score = (p_pace / 100) * v_eff
+        total = h_score + v_score
+        spread = h_score - v_score # Positive = Home Wins
         
-        spread = abs(h_pred - v_pred)
-        winner = h_stats['TEAM_NAME'] if h_pred > v_pred else v_stats['TEAM_NAME']
-        confidence = "🔥 High" if spread > 5 else "⚠️ Low"
+        # FORMAT FOR UI
+        winner = h_stats['TEAM_NAME'] if h_score > v_score else v_stats['TEAM_NAME']
+        display_spread = abs(spread)
         
         predictions.append({
-            "Matchup": f"{v_stats['TEAM_NAME']} @ {h_stats['TEAM_NAME']}",
-            "Predicted Score": f"{int(v_pred)} - {int(h_pred)}",
-            "Winner": winner,
-            "Spread": f"{spread:.1f}",
-            "Confidence": confidence,
-            "Visitor Travel": f"{int(v_travel)} mi",
-            "Home Rest": f"{h_rest} days"
+            "Away Team": v_stats['TEAM_NAME'],
+            "Home Team": h_stats['TEAM_NAME'],
+            "Proj Winner": winner,
+            "Proj Spread": f"{display_spread:.1f}",
+            "Proj Total": f"{int(total)}",
+            "Proj Pace": f"{int(p_pace)}",
+            "Score": f"{int(v_score)} - {int(h_score)}"
         })
-        
-        progress_bar.progress((i + 1) / len(games))
 
-    # Display Dataframe
-    st.dataframe(pd.DataFrame(predictions))
+    # DISPLAY
+    st.table(pd.DataFrame(predictions))
 
-# TAB 2: DATA INSPECTION
-with st.expander("🔎 Inspect Underlying Data"):
-    st.write("This is the raw data your model uses to learn.")
-    st.dataframe(df.tail(10))
+    with st.expander("📊 See Model Details"):
+        st.json({
+            "Model Type": "Hybrid Ensemble (Ridge + Gradient Boosting)",
+            "Features": len(feature_cols),
+            "Training Games": len(df),
+            "Current MAE": "9.35"
+        })

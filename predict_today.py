@@ -3,10 +3,13 @@ import joblib
 import numpy as np
 from nba_api.stats.endpoints import scoreboardv2
 from datetime import datetime
-from nba_locations import TEAM_COORDINATES  # Import the map we made
+from nba_locations import TEAM_COORDINATES
+import warnings
 
+warnings.filterwarnings("ignore", category=UserWarning)
+
+# 1. MATH HELPER
 def haversine_distance(lat1, lon1, lat2, lon2):
-    # Same math as before
     R = 3958.8
     phi1, phi2 = np.radians(lat1), np.radians(lat2)
     dphi = np.radians(lat2 - lat1)
@@ -15,160 +18,117 @@ def haversine_distance(lat1, lon1, lat2, lon2):
     c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
     return R * c
 
+# 2. GET SCHEDULE
 def get_todays_games():
     print("📅 Fetching today's schedule...")
     today = datetime.now().strftime('%Y-%m-%d')
     try:
         board = scoreboardv2.ScoreboardV2(game_date=today)
         games = board.game_header.get_data_frame()
-    except Exception as e:
-        print(f"❌ Error connecting to NBA API: {e}")
+        return games.to_dict('records')
+    except:
         return []
-    
-    if games.empty:
-        print("❌ No games scheduled for today.")
-        return []
-    
-    return games.to_dict('records')
 
-def get_team_stats_and_location(team_id, df):
-    # Find the most recent game
+# 3. GET TEAM STATS
+def get_team_stats(team_id, df):
     team_games = df[df['TEAM_ID'] == team_id].sort_values('GAME_DATE')
-    
-    if team_games.empty:
-        return None
-    
-    last_game = team_games.iloc[-1]
-    
-    # Get stats
-    stats = {
-        'AVG_10_PTS': last_game['AVG_10_PTS'],
-        'AVG_10_FG_PCT': last_game['AVG_10_FG_PCT'],
-        'AVG_10_PLUS_MINUS': last_game['AVG_10_PLUS_MINUS'],
-        'AVG_10_AST': last_game['AVG_10_AST'],
-        'AVG_10_REB': last_game['AVG_10_REB'],
-        'LAST_GAME_DATE': pd.to_datetime(last_game['GAME_DATE']),
-        # We need to know where they were last game to calc travel
-        'LAST_LAT': last_game['LAT'],
-        'LAST_LON': last_game['LON']
+    if team_games.empty: return None
+    last = team_games.iloc[-1]
+    return {
+        'ELO': last['ELO'],
+        'AVG_10_OFF_RTG': last['AVG_10_OFF_RTG'], 'AVG_10_PACE': last['AVG_10_PACE'],
+        'AVG_ALL_OFF_RTG': last['AVG_ALL_OFF_RTG'], 'AVG_ALL_PACE': last['AVG_ALL_PACE'],
+        'LAST_LAT': last['LAT'], 'LAST_LON': last['LON'],
+        'LAST_GAME_DATE': pd.to_datetime(last['GAME_DATE']),
+        'TEAM_NAME': last['TEAM_NAME']
     }
-    return stats
 
+# 4. MAIN PREDICTOR
 def predict_games():
-    print("🧠 Loading model and data...")
+    print("🧠 Loading Final Hybrid Model...")
     try:
-        model = joblib.load('nba_model.pkl')
+        models = joblib.load('nba_model_v2.pkl')
+        pace_model = models['pace']
+        eff_model = models['eff']
         df = pd.read_csv('nba_games_processed.csv')
         df['GAME_DATE'] = pd.to_datetime(df['GAME_DATE'])
     except FileNotFoundError:
-        print("❌ Error: Files not found. Run the pipeline first.")
+        print("❌ Error: Missing files.")
         return
 
     games = get_todays_games()
-    if not games:
-        return
+    if not games: return
 
-    print(f"\n🏀 Found {len(games)} games today. Predicting...\n")
-    print(f"{'MATCHUP':<30} | {'PRED SCORE':<15} | {'CONFIDENCE'}")
-    print("-" * 65)
+    print(f"\n🏀 Found {len(games)} games today.")
+    print(f"{'MATCHUP':<30} | {'PRED SCORE':<15} | {'PACE'} | {'TOTAL'}")
+    print("-" * 75)
 
-    today_date = pd.to_datetime(datetime.now().date())
+    today = pd.to_datetime(datetime.now().date())
+    
+    # Must match train_model.py exactly
+    feature_cols = [
+        'REST_DAYS', 'IS_HOME', 'ELO', 'ELO_OPP_LOOKUP',
+        'AVG_10_OFF_RTG', 'AVG_10_PACE', 'AVG_10_OFF_RTG_OPP_LOOKUP', 'AVG_10_PACE_OPP_LOOKUP',
+        'AVG_ALL_OFF_RTG', 'AVG_ALL_PACE', 'AVG_ALL_OFF_RTG_OPP_LOOKUP', 'AVG_ALL_PACE_OPP_LOOKUP',
+        'ELO_DIFF', 'OFF_RTG_DIFF', 'PACE_DIFF'
+    ]
 
-    for game in games:
-        home_id = game['HOME_TEAM_ID']
-        visitor_id = game['VISITOR_TEAM_ID']
+    for g in games:
+        h_id, v_id = g['HOME_TEAM_ID'], g['VISITOR_TEAM_ID']
+        h_stats = get_team_stats(h_id, df)
+        v_stats = get_team_stats(v_id, df)
         
-        # 1. Get Base Stats
-        home_stats = get_team_stats_and_location(home_id, df)
-        visitor_stats = get_team_stats_and_location(visitor_id, df)
-        
-        if not home_stats or not visitor_stats:
-            continue
+        if not h_stats or not v_stats: continue
+            
+        h_rest = (today - h_stats['LAST_GAME_DATE']).days
+        v_rest = (today - v_stats['LAST_GAME_DATE']).days
+        h_coords = TEAM_COORDINATES.get(h_id, {'lat':0, 'lon':0})
+        h_trav = haversine_distance(h_stats['LAST_LAT'], h_stats['LAST_LON'], h_coords['lat'], h_coords['lon'])
+        v_trav = haversine_distance(v_stats['LAST_LAT'], v_stats['LAST_LON'], h_coords['lat'], h_coords['lon'])
 
-        # 2. Calculate Rest & Fatigue
-        home_rest = (today_date - home_stats['LAST_GAME_DATE']).days
-        visitor_rest = (today_date - visitor_stats['LAST_GAME_DATE']).days
-        
-        # 3. Calculate Travel
-        # Home Team Location (They are at home)
-        home_coords = TEAM_COORDINATES.get(home_id)
-        # Visitor Team Location (They are at Home Team's arena)
-        # Note: Visitor travels TO the home arena.
-        current_arena_coords = home_coords 
-        
-        # Home Travel: Dist from Last Game -> Home Arena
-        home_travel = haversine_distance(
-            home_stats['LAST_LAT'], home_stats['LAST_LON'],
-            home_coords['lat'], home_coords['lon']
-        )
-        
-        # Visitor Travel: Dist from Last Game -> Home Arena
-        visitor_travel = haversine_distance(
-            visitor_stats['LAST_LAT'], visitor_stats['LAST_LON'],
-            current_arena_coords['lat'], current_arena_coords['lon']
-        )
+        # CALCULATE DIFFS
+        # Home Perspective
+        h_elo_diff = h_stats['ELO'] - v_stats['ELO']
+        h_off_diff = h_stats['AVG_10_OFF_RTG'] - v_stats['AVG_10_OFF_RTG'] # My Offense vs Their Offense (proxy)
+        h_pace_diff = h_stats['AVG_10_PACE'] - v_stats['AVG_10_PACE']
 
-        # 4. Build Input Rows
-        # Feature order MUST match train_model.py exactly
-        features = [
-            'REST_DAYS', 'IS_HOME', 'IS_B2B', 'TRAVEL_MILES',
-            'AVG_10_PTS', 'AVG_10_FG_PCT', 'AVG_10_PLUS_MINUS',
-            'AVG_10_AST', 'AVG_10_REB',
-            'AVG_10_PTS_OPP', 'AVG_10_PLUS_MINUS_OPP',
-            'IS_B2B_OPP', 'TRAVEL_MILES_OPP'
+        # Visitor Perspective
+        v_elo_diff = v_stats['ELO'] - h_stats['ELO']
+        v_off_diff = v_stats['AVG_10_OFF_RTG'] - h_stats['AVG_10_OFF_RTG']
+        v_pace_diff = v_stats['AVG_10_PACE'] - h_stats['AVG_10_PACE']
+
+        h_row = [
+            min(h_rest, 7), 1, h_stats['ELO'], v_stats['ELO'],
+            h_stats['AVG_10_OFF_RTG'], h_stats['AVG_10_PACE'], v_stats['AVG_10_OFF_RTG'], v_stats['AVG_10_PACE'],
+            h_stats['AVG_ALL_OFF_RTG'], h_stats['AVG_ALL_PACE'], v_stats['AVG_ALL_OFF_RTG'], v_stats['AVG_ALL_PACE'],
+            h_elo_diff, h_off_diff, h_pace_diff
+        ]
+        
+        v_row = [
+            min(v_rest, 7), 0, v_stats['ELO'], h_stats['ELO'],
+            v_stats['AVG_10_OFF_RTG'], v_stats['AVG_10_PACE'], h_stats['AVG_10_OFF_RTG'], h_stats['AVG_10_PACE'],
+            v_stats['AVG_ALL_OFF_RTG'], v_stats['AVG_ALL_PACE'], h_stats['AVG_ALL_OFF_RTG'], h_stats['AVG_ALL_PACE'],
+            v_elo_diff, v_off_diff, v_pace_diff
         ]
 
-        # Home Row
-        home_input = {
-            'REST_DAYS': min(home_rest, 7),
-            'IS_HOME': 1,
-            'IS_B2B': 1 if home_rest == 1 else 0,
-            'TRAVEL_MILES': home_travel,
-            'AVG_10_PTS': home_stats['AVG_10_PTS'],
-            'AVG_10_FG_PCT': home_stats['AVG_10_FG_PCT'],
-            'AVG_10_PLUS_MINUS': home_stats['AVG_10_PLUS_MINUS'],
-            'AVG_10_AST': home_stats['AVG_10_AST'],
-            'AVG_10_REB': home_stats['AVG_10_REB'],
-            'AVG_10_PTS_OPP': visitor_stats['AVG_10_PTS'],
-            'AVG_10_PLUS_MINUS_OPP': visitor_stats['AVG_10_PLUS_MINUS'],
-            'IS_B2B_OPP': 1 if visitor_rest == 1 else 0,
-            'TRAVEL_MILES_OPP': visitor_travel
-        }
-        
-        # Visitor Row
-        visitor_input = {
-            'REST_DAYS': min(visitor_rest, 7),
-            'IS_HOME': 0,
-            'IS_B2B': 1 if visitor_rest == 1 else 0,
-            'TRAVEL_MILES': visitor_travel,
-            'AVG_10_PTS': visitor_stats['AVG_10_PTS'],
-            'AVG_10_FG_PCT': visitor_stats['AVG_10_FG_PCT'],
-            'AVG_10_PLUS_MINUS': visitor_stats['AVG_10_PLUS_MINUS'],
-            'AVG_10_AST': visitor_stats['AVG_10_AST'],
-            'AVG_10_REB': visitor_stats['AVG_10_REB'],
-            'AVG_10_PTS_OPP': home_stats['AVG_10_PTS'],
-            'AVG_10_PLUS_MINUS_OPP': home_stats['AVG_10_PLUS_MINUS'],
-            'IS_B2B_OPP': 1 if home_rest == 1 else 0,
-            'TRAVEL_MILES_OPP': home_travel
-        }
-
         # Predict
-        home_pred = model.predict(pd.DataFrame([home_input])[features])[0]
-        visitor_pred = model.predict(pd.DataFrame([visitor_input])[features])[0]
-
-        # Display
-        # Find names (using a quick ID lookup from the processed df)
-        h_name = df[df['TEAM_ID'] == home_id]['TEAM_NAME'].iloc[0]
-        v_name = df[df['TEAM_ID'] == visitor_id]['TEAM_NAME'].iloc[0]
+        p_pace = (pace_model.predict(pd.DataFrame([h_row], columns=feature_cols))[0] + 
+                  pace_model.predict(pd.DataFrame([v_row], columns=feature_cols))[0]) / 2
         
-        matchup = f"{v_name} @ {h_name}"
-        score = f"{int(visitor_pred)} - {int(home_pred)}"
+        h_eff = eff_model.predict(pd.DataFrame([h_row], columns=feature_cols))[0]
+        v_eff = eff_model.predict(pd.DataFrame([v_row], columns=feature_cols))[0]
         
-        # Simple "Confidence" metric (Spread)
-        spread = abs(home_pred - visitor_pred)
-        winner = h_name if home_pred > visitor_pred else v_name
+        h_score = (p_pace / 100) * h_eff
+        v_score = (p_pace / 100) * v_eff
         
-        print(f"{matchup:<30} | {score:<15} | {winner} (+{spread:.1f})")
+        total = h_score + v_score
+        spread = abs(h_score - v_score)
+        winner = h_stats['TEAM_NAME'] if h_score > v_score else v_stats['TEAM_NAME']
+        
+        matchup = f"{v_stats['TEAM_NAME']} @ {h_stats['TEAM_NAME']}"
+        score_str = f"{int(v_score)} - {int(h_score)}"
+        
+        print(f"{matchup:<30} | {score_str:<15} | {int(p_pace)} | {int(total)} ({winner} +{spread:.1f})")
 
 if __name__ == "__main__":
     predict_games()
